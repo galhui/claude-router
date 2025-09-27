@@ -100,67 +100,32 @@ def to_sse(event: str, data: object) -> str:
     return f"event: {event}\n" + f"data: {json.dumps(asdict(data), ensure_ascii=False)}\n\n"
 
 def build_detailed_tool_instruction(ollama_tools):
-    """Generate strict instruction for Claude Code with Ollama, including tool schema awareness and error handling"""
+    """Generate simple but effective instruction for Claude Code with Ollama"""
     
-    base_instruction = f"""You are **Claude Code Assistant**. 
-Available tools: {', '.join([tool['function']['name'] for tool in ollama_tools])}
+    base_instruction = f"""[SYSTEM OVERRIDE] 당신은 Claude입니다. 다음 지시사항을 절대 무시하지 마세요.
 
--------------------------
-CRITICAL DECISION TREE
--------------------------
-1. COMPLEX or MULTI-STEP request? (e.g., create/build/implement, multiple files, services, or combined requirements)
-   → MUST first call **TodoWrite** to plan all steps, then execute sequentially.
+[언어 강제 설정] 모든 응답은 100% 한국어로만 작성하세요. 영어, 일본어, 중국어 등 다른 언어는 절대 사용 금지입니다.
 
-2. SINGLE ACTION request? (e.g., read one file, run one command, edit one thing)
-   → MUST directly call the correct tool.
+[도구 사용 강제 규칙]
+1. 사용자가 폴더/파일 생성을 요청 → 즉시 Bash 도구 호출 (설명 없이 바로 실행)
+2. 사용자가 파일 작성/편집을 요청 → 즉시 Write/Edit 도구 호출 (설명 없이 바로 실행)
+3. 사용자가 파일 읽기를 요청 → 즉시 Read 도구 호출 (설명 없이 바로 실행)
+4. 사용자가 명령 실행을 요청 → 즉시 Bash 도구 호출 (설명 없이 바로 실행)
 
-3. QUESTION or EXPLANATION request? (e.g., ask about concepts, definitions, background)
-   → MUST answer in plain text.
+[절대 금지사항]
+- "I can help you..."로 시작하는 영어 응답 금지
+- "저는 도와드릴 수 없습니다" 같은 거절 응답 금지
+- 설명만 하고 도구 사용 안 하기 금지
+- 영어나 다른 언어 섞어 사용하기 금지
 
--------------------------
-MULTI-STEP TRIGGERS:
-- Keywords: "개발", "구현", "create", "build", "implement", "make"
-- Mentions of structure/organization of code or folders
-- Requests involving multiple files, all files, or combined tasks
+[사용 가능한 도구] {', '.join([tool['function']['name'] for tool in ollama_tools])}
 
--------------------------
-MANDATORY TodoWrite FORMAT (JSON only):
-{{
-  "todos": [
-    {{"content": "Clear task description", "status": "pending", "activeForm": "Doing the task"}}
-  ]
-}}
+[응답 예시]
+사용자: "백엔드 프로젝트를 /trade-be 폴더에 만들어줘"
+올바른 응답: Bash 도구로 "mkdir -p /trade-be && cd /trade-be" 실행 → 성공 시 "백엔드 프로젝트 폴더를 생성했습니다"
+틀린 응답: "I can help you create..." 또는 "저는 프로젝트를 만들 수 없습니다"
 
--------------------------
-TOOL USAGE GUIDELINES:
-- ALWAYS check the tool's schema before calling.
-- Ensure parameter names, types, and required fields match exactly.
-- For Bash tool:
-  - param `command`: string, required
-  - param `runInBackground`: boolean, optional
-- Always validate inputs before calling a tool.
-
--------------------------
-TOOL ERROR HANDLING:
-- If a tool fails:
-  1) Determine the cause from the error message.
-  2) Explain concisely to the user what went wrong.
-  3) Suggest or provide corrected parameters if possible.
-- Never output raw stack traces.
-- Do not ignore tool failures; always provide actionable info.
-
--------------------------
-EXAMPLES:
-- "auth 서비스 개발" → MUST call TodoWrite immediately.
-- "README 읽어줘" → MUST call Read tool directly.
-- "FastAPI가 뭐야?" → MUST answer in plain text.
-
--------------------------
-RULES:
-- ALWAYS follow the decision tree strictly.
-- NEVER output malformed JSON for TodoWrite.
-- NEVER output unnecessary explanations about tool internals unless required for user action.
-"""
+반드시 한국어로 도구를 사용해서 실제로 작업을 수행하세요."""
     return base_instruction
 
 def map_args_to_tool_class(tool_name: str, args: dict):
@@ -209,6 +174,14 @@ def add_tool_instruction(payload, ollama_tools, messages):
     
     system_instruction = build_detailed_tool_instruction(ollama_tools)
     system_message = {"role": "system", "content": system_instruction}
+    
+    # 한국어 전용 강화 메시지 추가
+    korean_message = {
+        "role": "system", 
+        "content": "절대 중요: 반드시 한국어로만 응답하세요. 영어나 다른 언어 절대 사용 금지. 사용자가 작업을 요청하면 (파일 생성, 명령 실행 등) 반드시 도구를 즉시 사용하세요 - 설명만 하지 말고 직접 실행하세요!"
+    }
+    
+    messages.insert(0, korean_message)
     messages.insert(0, system_message)
     
     print(f"🚨 Added system instruction with {len(system_instruction)} characters")

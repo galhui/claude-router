@@ -13,7 +13,7 @@ cat <<EOF > "$SETTINGS_FILE"
   "env": {
     "ANTHROPIC_BASE_URL": "http://localhost:4000",
     "ANTHROPIC_API_KEY": "any-key",
-    "ANTHROPIC_MODEL": "gpt-oss"
+    "ANTHROPIC_MODEL": "gpt-oss:20b"
   },
   "allowedTools": ["*"],
   "hasTrustDialogAccepted": true,
@@ -23,14 +23,27 @@ EOF
 echo "✅ .claude/settings.local.json 생성 완료"
 
 # -----------------------------
-# 2. Python 패키지 설치
+# 2. Python 가상환경 설정
+# -----------------------------
+echo "📦 Python 가상환경 설정 중..."
+if [ ! -d "venv" ]; then
+    python3 -m venv venv
+    echo "✅ 가상환경 생성 완료"
+fi
+
+# 가상환경 활성화
+source venv/bin/activate
+echo "✅ 가상환경 활성화 완료"
+
+# -----------------------------
+# 3. Python 패키지 설치
 # -----------------------------
 echo "📦 Python 패키지 설치 중..."
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 echo "✅ Python 패키지 설치 완료"
 
 # -----------------------------
-# 3. Ollama 서비스 확인
+# 4. Ollama 서비스 확인
 # -----------------------------
 echo "🔍 Ollama 서비스 확인 중..."
 if ! curl -s http://localhost:11434/api/version > /dev/null 2>&1; then
@@ -41,18 +54,18 @@ fi
 echo "✅ Ollama 서비스 확인 완료"
 
 # -----------------------------
-# 4. GPT-OSS 모델 확인
+# 5. GPT-OSS 모델 확인
 # -----------------------------
-echo "🔍 GPT-OSS:20b 모델 확인 중..."
+echo "🔍 gpt-oss:20b 모델 확인 중..."
 if ! ollama list | grep -q "gpt-oss:20b"; then
-    echo "❌ GPT-OSS:20b 모델이 설치되지 않았습니다. 먼저 모델을 설치해주세요:"
+    echo "❌ gpt-oss:20b 모델이 설치되지 않았습니다. 먼저 모델을 설치해주세요:"
     echo "   ollama pull gpt-oss:20b"
     exit 1
 fi
-echo "✅ GPT-OSS:20b 모델 확인 완료"
+echo "✅ gpt-oss:20b 모델 확인 완료"
 
 # -----------------------------
-# 5. 포트 4000 확인 및 기존 서비스 종료
+# 6. 포트 4000 확인 및 기존 서비스 종료
 # -----------------------------
 echo "🔍 포트 4000 확인 중..."
 if lsof -ti:4000 > /dev/null 2>&1; then
@@ -63,7 +76,7 @@ if lsof -ti:4000 > /dev/null 2>&1; then
 fi
 
 # -----------------------------
-# 6. Claude Router 백그라운드 실행
+# 7. Claude Router 백그라운드 실행
 # -----------------------------
 echo "🚀 Claude Router 백그라운드에서 실행 중..."
 nohup uvicorn src.main:app --host 0.0.0.0 --port 4000 --reload > claude-router.log 2>&1 &

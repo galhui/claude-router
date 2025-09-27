@@ -74,7 +74,16 @@ async def clear_logs():
 
 
 def stream_from_ollama(messages, model=MODEL_NAME, tools=None, tool_choice=None):
-    payload = {"model": MODEL_NAME, "messages": messages, "stream": True}
+    payload = {
+        "model": MODEL_NAME, 
+        "messages": messages, 
+        "stream": True,
+        "options": {
+            "temperature": 0.1,  # 낮은 온도로 일관된 응답
+            "top_p": 0.9,
+            "top_k": 10
+        }
+    }
 
     if tools:
         ollama_tools = convert_claude_tools_to_ollama(tools)
@@ -105,61 +114,51 @@ def stream_from_ollama(messages, model=MODEL_NAME, tools=None, tool_choice=None)
                 for line in resp.iter_lines(decode_unicode=True):
                     if not line.strip():
                         continue
+                    
+                    # vLLM API는 "data: " prefix를 사용
+                    if line.startswith("data: "):
+                        line = line[6:]  # "data: " 제거
+                    
+                    if line.strip() == "[DONE]":
+                        print("� Stream ended, [DONE] received")
+                        break
+                        
                     try:
                         data = json.loads(line.strip())
-                        message = data.get("message", {})
-                        content = message.get("content", "")
-                        thinking = message.get("thinking", "")
-                        tool_calls = message.get("tool_calls", [])
                         
-                        print(f"🔍 Received: done={data.get('done')}, thinking={thinking}, content='{content}', tool_calls={len(tool_calls)}")
+                        # vLLM/OpenAI 형식에서 choices 배열 처리
+                        choices = data.get("choices", [])
+                        if not choices:
+                            continue
+                            
+                        choice = choices[0]
+                        delta = choice.get("delta", {})
+                        content = delta.get("content", "")
+                        tool_calls = delta.get("tool_calls", [])
+                        finish_reason = choice.get("finish_reason")
+                        
+                        print(f"🔍 Received: finish_reason={finish_reason}, content='{content}', tool_calls={len(tool_calls)}")
 
-                        if data.get("done", False):
-                            print(f"🔚 Stream ended, done=True detected")
+                        if finish_reason == "stop" or finish_reason == "tool_calls":
+                            print(f"🔚 Stream ended, finish_reason={finish_reason}")
                             if tool_calls:
                                 print(f"🛠️  Found {len(tool_calls)} tool calls in final message")
                                 final_tool_calls = tool_calls
-                            else:
-                                print("❌ No tool_calls in final message")
-                            # Break to exit the streaming loop and process tool calls below
                             break
-                        
-                        if thinking:
-                            thinking_text += thinking
-                            if current_block_type and current_block_type != "thinking":
-                                yield to_sse(event=Event.content_block_stop.value, data=ContentBlockStop(index=current_block_index))
-                                current_block_index += 1
-                            
-                            if current_block_type != "thinking":
-                                current_block_type = "thinking"
-                                start_event = ContentBlockThinkingStart(index=current_block_index)
-                                yield to_sse(event=Event.content_block_start.value, data=start_event)
-                            
-                            delta_event = ContentBlockThinkingDelta(index=current_block_index, delta=ContentBlockThinkingDeltaDelta(thinking=thinking))
-                            yield to_sse(event=Event.content_block_delta.value, data=delta_event)
-                            continue
 
                         if content:
                             full_response += content
-                            if current_block_type and current_block_type != "content":
-                                signature_event = ContentBlockSignatureDelta(
-                                    index=current_block_index,
-                                    delta=ContentBlockSignatureDeltaDelta(signature=generate_signature(thinking_text))
-                                )
-                                yield to_sse(event=Event.content_block_delta.value, data=signature_event)
-                                
-                                content_block_stop = ContentBlockStop(index=current_block_index)
-                                yield to_sse(event=Event.content_block_stop.value, data=content_block_stop)
-                                current_block_index += 1
-                            
                             if current_block_type != "content":
+                                if current_block_type:
+                                    yield to_sse(event=Event.content_block_stop.value, data=ContentBlockStop(index=current_block_index))
+                                    current_block_index += 1
+                                
                                 current_block_type = "content"
                                 start_event = ContentBlockStart(index=current_block_index, content_block=ContentBlock(text=""))
                                 yield to_sse(event=Event.content_block_start.value, data=start_event)
                             
                             delta_event = ContentBlockDelta(index=current_block_index, delta=ContentBlockDeltaDelta(text=content))
                             yield to_sse(event=Event.content_block_delta.value, data=delta_event)
-                            continue
 
                     except json.JSONDecodeError as e:
                         print(f"⚠️  JSON decode error: {e}")
