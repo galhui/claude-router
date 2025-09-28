@@ -19,6 +19,11 @@ import subprocess
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+import asyncio
+
+# Agent 시스템 import
+from src.agent.analyzer import QueryAnalyzer
+from src.agent.executor import WorkflowExecutor
 
 # src 폴더에 있는 type.py와 util.py를 임포트합니다.
 from src.type import *
@@ -28,9 +33,9 @@ from src.agent.executor import WorkflowExecutor
 
 app = FastAPI()
 
-# Agent 시스템 초기화
+# Agent 시스템 초기화 
 query_analyzer = QueryAnalyzer()
-workflow_executor = WorkflowExecutor(ollama_client=None)  # ollama client는 나중에 설정
+workflow_executor = None  # 서버 시작 후 초기화
 
 # -----------------------------
 # 1. 설정 로드
@@ -45,6 +50,23 @@ from src.const import DEFAULT_OLLAMA_URL, DEFAULT_MODEL_NAME, DEFAULT_HOST, DEFA
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", config.get('ollama_url', DEFAULT_OLLAMA_URL))
 MODEL_NAME = os.getenv("MODEL_NAME", config.get('model_name', DEFAULT_MODEL_NAME))
+
+@app.on_event("startup")
+async def startup_event():
+    """서버 시작 시 Agent 시스템 초기화"""
+    global workflow_executor
+    
+    # 간단한 클라이언트 객체 생성 (requests 사용)
+    class SimpleOllamaClient:
+        def __init__(self, base_url):
+            self.base_url = base_url.rstrip('/')
+        
+        def post(self, endpoint, **kwargs):
+            return requests.post(f"{self.base_url}{endpoint}", **kwargs)
+    
+    ollama_client = SimpleOllamaClient(OLLAMA_URL)
+    workflow_executor = WorkflowExecutor(ollama_client=ollama_client)
+    print("🤖 Agent 시스템 초기화 완료")
 HOST = os.getenv("PROXY_HOST", config.get('host', DEFAULT_HOST))
 PORT = int(os.getenv("PROXY_PORT", config.get('port', DEFAULT_PORT)))
 
@@ -451,6 +473,165 @@ async def messages_endpoint(request: Request):
     tools = payload.get("tools")
     tool_choice = payload.get("tool_choice")
     
+    # 최신 사용자 메시지 추출
+    user_message = ""
+    if messages and isinstance(messages, list):
+        for msg in reversed(messages):  # 뒤에서부터 찾기
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    user_message = content
+                elif isinstance(content, list):
+                    # content가 배열인 경우 텍스트 부분만 추출하되 system-reminder는 제외
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text_content = item.get("text", "")
+                            # system-reminder 메시지 제외
+                            if not text_content.startswith("<system-reminder>"):
+                                user_message = text_content
+                                if user_message:  # 첫 번째 유효한 사용자 메시지 찾으면 종료
+                                    break
+                break
+    
+    # Agent 시스템 트리거 조건 확인
+    should_use_agent = False
+    agent_keywords = [
+        "만들어", "생성", "create", "프로젝트", "project", 
+        "설치", "install", "설정", "config", "초기화", "init",
+        "nestjs", "react", "vue", "node", "python", "django", "flask"
+    ]
+    
+    if user_message:
+        user_message_lower = user_message.lower()
+        should_use_agent = any(keyword in user_message_lower for keyword in agent_keywords)
+        print(f"🤖 User message: {user_message[:100]}...")
+        print(f"🤖 Should use agent: {should_use_agent}")
+    
+    # Agent 시스템 사용
+    if should_use_agent and user_message:
+        print("🚀 Agent 시스템으로 처리 중...")
+        try:
+            # 1. 질문 분석
+            plan = query_analyzer.analyze_query(user_message)
+            print(f"🎯 실행 계획: {plan.goal}")
+            print(f"📋 총 {len(plan.tasks)}개 태스크")
+            
+            # 2. 워크플로우 실행 시작
+            async def agent_stream():
+                try:
+                    # Message start 이벤트
+                    start_message = Message(model=model)
+                    message_start_event = MessageStart(message=start_message)
+                    yield to_sse(event=Event.message_start.value, data=message_start_event)
+                    
+                    # Thinking 블록 시작
+                    thinking_block = ContentBlockThinking()
+                    thinking_start = ContentBlockStart(index=0, content_block=thinking_block)
+                    yield to_sse(event=Event.content_block_start.value, data=thinking_start)
+                    
+                    # 계획 설명
+                    thinking_text = f"사용자가 '{user_message}'를 요청했습니다. 이를 {len(plan.tasks)}개의 단계로 나누어 처리하겠습니다:\n"
+                    for i, task in enumerate(plan.tasks, 1):
+                        thinking_text += f"{i}. {task.title}: {task.description}\n"
+                    
+                    # Thinking 내용 스트리밍
+                    for char in thinking_text:
+                        thinking_delta = ContentBlockThinkingDeltaDelta(thinking=char)
+                        delta_event = ContentBlockDelta(index=0, delta=thinking_delta)
+                        yield to_sse(event=Event.content_block_delta.value, data=delta_event)
+                        await asyncio.sleep(0.01)  # 자연스러운 타이핑 효과
+                    
+                    # Thinking 종료
+                    signature_event = ContentBlockSignatureDelta(
+                        index=0,
+                        delta=ContentBlockSignatureDeltaDelta(signature=generate_signature(thinking_text))
+                    )
+                    yield to_sse(event=Event.content_block_delta.value, data=signature_event)
+                    yield to_sse(event=Event.content_block_stop.value, data=ContentBlockStop(index=0))
+                    
+                    # 워크플로우 실행
+                    print("🚀 워크플로우 실행 시작...")
+                    result = await workflow_executor.execute_workflow(plan)
+                    print(f"🎯 워크플로우 실행 결과: {result}")
+                    
+                    # 결과를 content 블록으로 스트리밍
+                    content_block = ContentBlock(text="")
+                    content_start = ContentBlockStart(index=1, content_block=content_block)
+                    yield to_sse(event=Event.content_block_start.value, data=content_start)
+                    
+                    # 결과 메시지 생성
+                    if result["status"] == "waiting_for_user":
+                        response_text = f"✅ 계획이 수립되었습니다!\n\n📋 **{plan.goal}** 작업을 진행하겠습니다.\n\n"
+                        
+                        # 대기 중인 태스크 정보 표시
+                        waiting_tasks = [t for t in plan.tasks if t.status.value == "waiting_for_user"]
+                        if waiting_tasks:
+                            task = waiting_tasks[0]
+                            response_text += f"⏳ **다음 단계**: {task.title}\n\n"
+                            if task.user_prompt:
+                                response_text += f"💬 {task.user_prompt}\n\n"
+                            
+                            if task.expected_inputs:
+                                response_text += "📝 **설정이 필요한 항목들**:\n"
+                                for inp in task.expected_inputs:
+                                    response_text += f"- **{inp['description']}**: "
+                                    if inp.get('options'):
+                                        response_text += f"({', '.join(inp['options'])})"
+                                    if inp.get('default'):
+                                        response_text += f" [기본값: {inp['default']}]"
+                                    response_text += "\n"
+                        
+                        response_text += f"\n🔗 세션 ID: `{result.get('session_id')}`\n"
+                        response_text += f"🆔 워크플로우 ID: `{result.get('workflow_id')}`\n"
+                        
+                    elif result["status"] == "completed":
+                        response_text = f"🎉 **{plan.goal}** 작업이 완료되었습니다!\n\n"
+                        response_text += f"✅ 총 {result['completed_tasks']}/{result['total_tasks']}개 태스크 완료\n\n"
+                        
+                        # 실행된 작업들 요약
+                        for task_result in result.get('results', []):
+                            if task_result['status'] == 'completed':
+                                response_text += f"✅ {task_result['title']}\n"
+                            else:
+                                response_text += f"❌ {task_result['title']}: {task_result.get('error', '실패')}\n"
+                    
+                    else:
+                        response_text = f"❌ 작업 중 오류가 발생했습니다: {result.get('error', '알 수 없는 오류')}"
+                    
+                    # 응답 텍스트 스트리밍
+                    for char in response_text:
+                        text_delta = ContentBlockDeltaDelta(text=char)
+                        delta_event = ContentBlockDelta(index=1, delta=text_delta)
+                        yield to_sse(event=Event.content_block_delta.value, data=delta_event)
+                        await asyncio.sleep(0.005)
+                    
+                    yield to_sse(event=Event.content_block_stop.value, data=ContentBlockStop(index=1))
+                    
+                    # Message delta와 stop
+                    usage_info = Usage(output_tokens=len(response_text.split()))
+                    message_delta = MessageDelta(usage=usage_info)
+                    yield to_sse(event=Event.message_delta.value, data=message_delta)
+                    
+                    message_stop = MessageStop()
+                    yield to_sse(event=Event.message_stop.value, data=message_stop)
+                    
+                except Exception as e:
+                    print(f"❌ Agent 처리 오류: {e}")
+                    error_event = Error(error=ErrorMessage(message=str(e)))
+                    yield to_sse(event=Event.error.value, data=error_event)
+            
+            return StreamingResponse(
+                agent_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "Access-Control-Allow-Origin": "*"}
+            )
+            
+        except Exception as e:
+            print(f"❌ Agent 시스템 오류: {e}")
+            # 오류 시 일반 Claude 대화로 폴백
+    
+    # 일반 Claude 대화 처리
+    print("💬 일반 Claude 대화로 처리 중...")
     # Convert Anthropic messages format to Ollama format
     if messages and isinstance(messages, list):
         from src.util import convert_messages_to_ollama_format

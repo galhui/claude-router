@@ -42,14 +42,14 @@ class WorkflowExecutor:
                 result = await self._execute_task(task, session)
                 results.append(result)
                 
-                # 실패 시 워크플로우 중단 (사용자 입력 대기는 제외)
-                if task.status == TaskStatus.FAILED:
-                    plan.status = TaskStatus.FAILED
-                    break
-                elif task.status == TaskStatus.WAITING_FOR_USER:
-                    # 사용자 입력 대기 중이면 일시 중지
+                # 사용자 입력 대기나 실패 시 워크플로우 중단
+                if task.status == TaskStatus.WAITING_FOR_USER:
                     plan.status = TaskStatus.WAITING_FOR_USER
-                    print(f"⏸️  사용자 입력 대기로 워크플로우 일시 중지")
+                    print(f"⏸️  사용자 입력 대기로 워크플로우 일시 중지: {task.title}")
+                    break
+                elif task.status == TaskStatus.FAILED:
+                    plan.status = TaskStatus.FAILED
+                    print(f"❌ 태스크 실패로 워크플로우 중단: {task.title}")
                     break
             
             if plan.status != TaskStatus.FAILED:
@@ -152,10 +152,13 @@ class WorkflowExecutor:
         """실행 태스크 실행 (도구 호출)"""
         results = []
         
-        # 사용자 응답을 기반으로 템플릿 변수 교체
+        # 워크플로우의 모든 태스크에서 사용자 응답 수집
         template_vars = {}
-        if task.user_response:
-            template_vars.update(task.user_response)
+        workflow = session.current_workflow
+        for prev_task in workflow.tasks:
+            if prev_task.user_response:
+                template_vars.update(prev_task.user_response)
+                print(f"📝 템플릿 변수 추가: {prev_task.user_response}")
         
         for tool_call in task.tool_calls:
             tool_name = tool_call.get("tool")
@@ -164,14 +167,17 @@ class WorkflowExecutor:
             # 템플릿 변수 교체
             processed_arguments = self._replace_template_variables(arguments, template_vars)
             
-            print(f"🛠️  도구 호출: {tool_name} - {processed_arguments}")
+            print(f"🛠️  도구 호출: {tool_name}")
+            print(f"   원본: {arguments}")
+            print(f"   처리됨: {processed_arguments}")
             
-            # Ollama를 통해 도구 실행 요청
+            # 도구 실행
             if tool_name == "Bash":
-                # 간단한 bash 명령어는 직접 실행 가능
                 import subprocess
                 try:
                     command = processed_arguments.get("command", "")
+                    print(f"💻 실행 명령어: {command}")
+                    
                     result = subprocess.run(
                         command,
                         shell=True,
@@ -184,25 +190,44 @@ class WorkflowExecutor:
                         "command": command,
                         "stdout": result.stdout,
                         "stderr": result.stderr,
-                        "returncode": result.returncode
+                        "returncode": result.returncode,
+                        "success": result.returncode == 0
                     })
+                    
+                    if result.returncode == 0:
+                        print(f"✅ 명령어 성공 실행")
+                    else:
+                        print(f"❌ 명령어 실패: {result.stderr}")
+                        
                 except subprocess.TimeoutExpired:
+                    print(f"⏱️  명령어 시간 초과")
                     results.append({
                         "tool": tool_name,
                         "command": command,
-                        "error": "Timeout"
+                        "error": "Timeout",
+                        "success": False
+                    })
+                except Exception as e:
+                    print(f"❌ 명령어 실행 오류: {e}")
+                    results.append({
+                        "tool": tool_name,
+                        "command": command,
+                        "error": str(e),
+                        "success": False
                     })
             else:
                 # 다른 도구들은 Ollama를 통해 처리
                 results.append({
                     "tool": tool_name,
                     "arguments": processed_arguments,
-                    "note": "도구 실행 로직 구현 필요"
+                    "note": "도구 실행 로직 구현 필요",
+                    "success": True
                 })
         
         return {
             "type": "execution",
-            "tool_results": results
+            "tool_results": results,
+            "template_vars_used": template_vars
         }
     
     def _replace_template_variables(self, arguments: Dict[str, Any], variables: Dict[str, Any]) -> Dict[str, Any]:

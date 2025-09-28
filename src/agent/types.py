@@ -57,3 +57,13 @@ class SessionState:
     conversation_history: List[Dict[str, Any]] = field(default_factory=list)
     context: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class WorkflowSession:
+    """워크플로우 실행 세션"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    workflow: WorkflowPlan = field(default_factory=lambda: WorkflowPlan())
+    user_inputs: Dict[str, Any] = field(default_factory=dict)  # 사용자 입력 저장
+    created_at: datetime = field(default_factory=datetime.now)
+    last_activity: datetime = field(default_factory=datetime.now)
+    completed: bool = False

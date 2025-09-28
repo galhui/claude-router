@@ -111,129 +111,106 @@ class QueryAnalyzer:
         # 프로젝트명 추출
         project_name = self._extract_project_name(query)
         
-        # 1. 프로젝트 설정 확인 (Interactive Task)
-        config_task = Task(
-            title="프로젝트 설정 확인",
-            description="프로젝트 생성에 필요한 세부 설정을 확인합니다",
-            type=TaskType.USER_INPUT,
-            user_prompt=f"'{project_name}' 프로젝트를 생성합니다. 다음 설정을 확인해주세요:",
-            expected_inputs=[
-                {
-                    "name": "project_name",
-                    "type": "string",
-                    "description": "프로젝트 이름",
-                    "default": project_name,
-                    "required": True
-                },
-                {
-                    "name": "description",
-                    "type": "string", 
-                    "description": "프로젝트 설명",
-                    "default": f"{project_name} 백엔드 서버",
-                    "required": False
-                },
-                {
-                    "name": "package_manager",
-                    "type": "select",
-                    "description": "패키지 매니저 선택",
-                    "options": ["npm", "yarn", "pnpm"],
-                    "default": "npm",
-                    "required": True
-                }
-            ]
+        # 간단한 실행 태스크들로 구성 (사용자 입력 없이)
+        
+        # 1. 분석 태스크 (기본 정보 설정)
+        analysis_task = Task(
+            title="질문 분석",
+            description=f"'{query}' 요청 분석 및 목표 설정",
+            type=TaskType.ANALYSIS
         )
-        plan.tasks.append(config_task)
+        plan.tasks.append(analysis_task)
         
         # 2. 디렉토리 생성
         dir_task = Task(
             title="프로젝트 디렉토리 생성",
             description="프로젝트 디렉토리를 생성합니다",
             type=TaskType.EXECUTION,
-            dependencies=[config_task.id],
+            dependencies=[analysis_task.id],
             tool_calls=[{
                 "tool": "Bash",
                 "arguments": {
-                    "command": "mkdir -p {{project_name}} && cd {{project_name}}",
+                    "command": f"mkdir -p {project_name}",
                     "description": "프로젝트 디렉토리 생성"
                 }
             }]
         )
         plan.tasks.append(dir_task)
         
-        # 3. NestJS 프로젝트 초기화 확인
+        # NestJS 프로젝트인 경우
         if 'nestjs' in query.lower():
-            nestjs_confirm_task = Task(
-                title="NestJS 설정 확인",
-                description="NestJS 프로젝트 추가 설정을 확인합니다",
-                type=TaskType.CONFIRMATION,
-                dependencies=[dir_task.id],
-                user_prompt="NestJS 프로젝트를 초기화하시겠습니까? 다음 설정을 포함합니다:\n- TypeScript 설정\n- ESLint, Prettier 설정\n- 기본 모듈 구조",
-                expected_inputs=[
-                    {
-                        "name": "confirm",
-                        "type": "boolean",
-                        "description": "초기화 진행 여부",
-                        "required": True
-                    },
-                    {
-                        "name": "include_database",
-                        "type": "select",
-                        "description": "데이터베이스 모듈 포함",
-                        "options": ["none", "typeorm", "prisma", "mongoose"],
-                        "default": "typeorm",
-                        "required": False
-                    },
-                    {
-                        "name": "include_auth",
-                        "type": "boolean",
-                        "description": "인증 모듈 포함 여부",
-                        "default": True,
-                        "required": False
-                    }
-                ]
-            )
-            plan.tasks.append(nestjs_confirm_task)
-            
-            # 4. NestJS 프로젝트 초기화
-            init_task = Task(
-                title="NestJS 프로젝트 초기화",
-                description="NestJS CLI로 프로젝트를 생성합니다",
+            # 3. NestJS CLI 설치 확인
+            cli_task = Task(
+                title="NestJS CLI 확인",
+                description="NestJS CLI가 설치되어 있는지 확인하고 필요시 설치합니다",
                 type=TaskType.EXECUTION,
-                dependencies=[nestjs_confirm_task.id],
+                dependencies=[dir_task.id],
                 tool_calls=[{
                     "tool": "Bash",
                     "arguments": {
-                        "command": "npx @nestjs/cli new {{project_name}} --skip-git",
-                        "description": "NestJS 프로젝트 초기화"
+                        "command": "npm list -g @nestjs/cli || npm install -g @nestjs/cli",
+                        "description": "NestJS CLI 설치 확인 및 설치"
                     }
                 }]
             )
-            plan.tasks.append(init_task)
+            plan.tasks.append(cli_task)
             
-            # 5. 의존성 설치
+            # 4. NestJS 프로젝트 생성
+            create_task = Task(
+                title="NestJS 프로젝트 초기화",
+                description="NestJS CLI로 프로젝트를 생성합니다",
+                type=TaskType.EXECUTION,
+                dependencies=[cli_task.id],
+                tool_calls=[{
+                    "tool": "Bash",
+                    "arguments": {
+                        "command": f"nest new {project_name} --package-manager npm --skip-git",
+                        "description": "NestJS 프로젝트 생성"
+                    }
+                }]
+            )
+            plan.tasks.append(create_task)
+            
+            # 5. 의존성 설치 확인
             deps_task = Task(
                 title="의존성 설치",
                 description="프로젝트 의존성 패키지를 설치합니다",
                 type=TaskType.EXECUTION,
-                dependencies=[init_task.id],
+                dependencies=[create_task.id],
                 tool_calls=[{
                     "tool": "Bash",
                     "arguments": {
-                        "command": "cd {{project_name}} && {{package_manager}} install",
-                        "description": "패키지 설치"
+                        "command": f"cd {project_name} && npm install",
+                        "description": "의존성 설치"
                     }
                 }]
             )
             plan.tasks.append(deps_task)
-        
-        # 6. 최종 확인
-        final_confirm_task = Task(
-            title="프로젝트 생성 완료 확인",
-            description="프로젝트가 정상적으로 생성되었는지 확인합니다",
-            type=TaskType.VERIFICATION,
-            dependencies=[deps_task.id if 'deps_task' in locals() else dir_task.id]
-        )
-        plan.tasks.append(final_confirm_task)
+            
+            # 6. 생성 확인
+            verify_task = Task(
+                title="프로젝트 생성 완료 확인",
+                description="프로젝트가 정상적으로 생성되었는지 확인합니다",
+                type=TaskType.VERIFICATION,
+                dependencies=[deps_task.id],
+                tool_calls=[{
+                    "tool": "Bash",
+                    "arguments": {
+                        "command": f"ls -la {project_name}",
+                        "description": "프로젝트 구조 확인"
+                    }
+                }]
+            )
+            plan.tasks.append(verify_task)
+            
+            # 7. 최종 검증
+            final_task = Task(
+                title="결과 검증",
+                description="모든 작업이 올바르게 완료되었는지 확인",
+                type=TaskType.VERIFICATION,
+                dependencies=[verify_task.id]
+            )
+            plan.tasks.append(final_task)
     
     def _extract_project_name(self, query: str) -> str:
         """질문에서 프로젝트명 추출"""
