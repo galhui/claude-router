@@ -23,8 +23,14 @@ from fastapi.responses import StreamingResponse
 # src 폴더에 있는 type.py와 util.py를 임포트합니다.
 from src.type import *
 from src.util import add_tool_instruction, build_message_start, convert_claude_tools_to_ollama, generate_signature, to_sse, convert_ollama_tool_call_to_claude, dict_to_ollama_tool_call
+from src.agent.analyzer import QueryAnalyzer
+from src.agent.executor import WorkflowExecutor
 
 app = FastAPI()
+
+# Agent 시스템 초기화
+query_analyzer = QueryAnalyzer()
+workflow_executor = WorkflowExecutor(ollama_client=None)  # ollama client는 나중에 설정
 
 # -----------------------------
 # 1. 설정 로드
@@ -72,6 +78,146 @@ async def clear_logs():
     except Exception as e:
         return {"status": "error", "message": f"Failed to clear log file: {str(e)}"}
 
+@app.post("/v1/agent/analyze")
+async def analyze_query(request: Request):
+    """질문 분석 및 워크플로우 계획 생성"""
+    payload = await request.json()
+    query = payload.get("query", "")
+    
+    if not query:
+        return {"error": "질문이 필요합니다"}
+    
+    try:
+        plan = query_analyzer.analyze_query(query)
+        return {
+            "workflow_id": plan.id,
+            "goal": plan.goal,
+            "total_tasks": len(plan.tasks),
+            "tasks": [{
+                "id": task.id,
+                "title": task.title,
+                "description": task.description,
+                "type": task.type.value,
+                "status": task.status.value
+            } for task in plan.tasks]
+        }
+    except Exception as e:
+        return {"error": f"분석 실패: {str(e)}"}
+
+@app.post("/v1/agent/execute")
+async def execute_workflow(request: Request):
+    """워크플로우 실행"""
+    payload = await request.json()
+    query = payload.get("query", "")
+    session_id = payload.get("session_id")
+    
+    if not query:
+        return {"error": "질문이 필요합니다"}
+    
+    try:
+        # 1. 질문 분석
+        plan = query_analyzer.analyze_query(query)
+        print(f"🎯 실행 계획: {plan.goal}")
+        print(f"📋 총 {len(plan.tasks)}개 태스크")
+        
+        # 2. 워크플로우 실행
+        result = await workflow_executor.execute_workflow(plan, session_id)
+        return result
+        
+    except Exception as e:
+        return {"error": f"실행 실패: {str(e)}"}
+
+@app.get("/v1/agent/status/{workflow_id}")
+async def get_workflow_status(workflow_id: str, session_id: str):
+    """워크플로우 진행 상황 조회"""
+    return workflow_executor.get_workflow_status(workflow_id, session_id)
+
+@app.post("/v1/agent/respond")
+async def respond_to_task(request: Request):
+    """사용자 입력이 필요한 태스크에 응답"""
+    payload = await request.json()
+    session_id = payload.get("session_id")
+    task_id = payload.get("task_id")
+    user_response = payload.get("response", {})
+    
+    if not session_id or not task_id:
+        return {"error": "session_id와 task_id가 필요합니다"}
+    
+    try:
+        # 세션에서 해당 태스크 찾기
+        if session_id not in workflow_executor.sessions:
+            return {"error": "세션을 찾을 수 없습니다"}
+        
+        session = workflow_executor.sessions[session_id]
+        workflow = session.current_workflow
+        
+        if not workflow:
+            return {"error": "활성 워크플로우가 없습니다"}
+        
+        # 태스크 찾기
+        task = None
+        for t in workflow.tasks:
+            if t.id == task_id:
+                task = t
+                break
+        
+        if not task:
+            return {"error": "태스크를 찾을 수 없습니다"}
+        
+        if task.status != TaskStatus.WAITING_FOR_USER:
+            return {"error": "이 태스크는 사용자 입력을 기다리고 있지 않습니다"}
+        
+        # 사용자 응답 저장
+        task.user_response = user_response
+        task.status = TaskStatus.PENDING  # 다시 실행 대기 상태로
+        
+        print(f"📥 사용자 응답 수신: Task {task_id} - {user_response}")
+        
+        # 워크플로우 재개
+        result = await workflow_executor.resume_workflow(workflow.id, session_id)
+        
+        return {
+            "message": "사용자 응답이 처리되었습니다",
+            "task_id": task_id,
+            "workflow_result": result
+        }
+        
+    except Exception as e:
+        return {"error": f"응답 처리 실패: {str(e)}"}
+
+@app.post("/v1/agent/skip")  
+async def skip_task(request: Request):
+    """사용자 입력 태스크 건너뛰기"""
+    payload = await request.json()
+    session_id = payload.get("session_id")
+    task_id = payload.get("task_id")
+    
+    if not session_id or not task_id:
+        return {"error": "session_id와 task_id가 필요합니다"}
+    
+    try:
+        session = workflow_executor.sessions[session_id]
+        workflow = session.current_workflow
+        
+        task = None
+        for t in workflow.tasks:
+            if t.id == task_id:
+                task = t
+                break
+        
+        if task:
+            task.status = TaskStatus.SKIPPED
+            print(f"⏭️  태스크 건너뛰기: {task.title}")
+            
+            # 워크플로우 재개
+            result = await workflow_executor.resume_workflow(workflow.id, session_id)
+            return {"message": "태스크가 건너뛰어졌습니다", "workflow_result": result}
+        else:
+            return {"error": "태스크를 찾을 수 없습니다"}
+            
+    except Exception as e:
+        return {"error": f"건너뛰기 실패: {str(e)}"}
+
 
 def stream_from_ollama(messages, model=MODEL_NAME, tools=None, tool_choice=None):
     payload = {
@@ -112,12 +258,15 @@ def stream_from_ollama(messages, model=MODEL_NAME, tools=None, tool_choice=None)
                 final_tool_calls = None
 
                 for line in resp.iter_lines(decode_unicode=True):
-                    if not line.strip():
+                    if not line or not line.strip():
                         continue
                     
-                    # vLLM API는 "data: " prefix를 사용
-                    if line.startswith("data: "):
-                        line = line[6:]  # "data: " 제거
+                    # Ensure line is a string
+                    if isinstance(line, bytes):
+                        line = line.decode('utf-8')
+                    
+                    # Ollama API는 직접 JSON을 반환 (data: prefix 없음)
+                    line = line.strip()
                     
                     if line.strip() == "[DONE]":
                         print("� Stream ended, [DONE] received")
@@ -126,43 +275,69 @@ def stream_from_ollama(messages, model=MODEL_NAME, tools=None, tool_choice=None)
                     try:
                         data = json.loads(line.strip())
                         
-                        # vLLM/OpenAI 형식에서 choices 배열 처리
-                        choices = data.get("choices", [])
-                        if not choices:
-                            continue
-                            
-                        choice = choices[0]
-                        delta = choice.get("delta", {})
-                        content = delta.get("content", "")
-                        tool_calls = delta.get("tool_calls", [])
-                        finish_reason = choice.get("finish_reason")
+                        # Ollama 형식: {"message": {"content": "text"}, "done": false}
+                        message = data.get("message", {})
+                        content = message.get("content", "")
+                        thinking = message.get("thinking", "")
+                        done = data.get("done", False)
                         
-                        print(f"🔍 Received: finish_reason={finish_reason}, content='{content}', tool_calls={len(tool_calls)}")
+                        print(f"🔍 Received: done={done}, content='{content}', thinking='{thinking}'")
 
-                        if finish_reason == "stop" or finish_reason == "tool_calls":
-                            print(f"🔚 Stream ended, finish_reason={finish_reason}")
-                            if tool_calls:
-                                print(f"🛠️  Found {len(tool_calls)} tool calls in final message")
-                                final_tool_calls = tool_calls
+                        if done:
+                            print(f"🔚 Stream ended, done={done}")
                             break
 
                         if content:
                             full_response += content
                             if current_block_type != "content":
-                                if current_block_type:
+                                if current_block_type == "thinking":
+                                    # thinking에서 content로 전환 시 thinking 블록 종료 + signature
+                                    if thinking_text:
+                                        signature_event = ContentBlockSignatureDelta(
+                                            index=current_block_index,
+                                            delta=ContentBlockSignatureDeltaDelta(signature=generate_signature(thinking_text))
+                                        )
+                                        yield to_sse(event=Event.content_block_delta.value, data=signature_event)
+                                    
+                                    yield to_sse(event=Event.content_block_stop.value, data=ContentBlockStop(index=current_block_index))
+                                    current_block_index += 1
+                                    print(f"🧠 Ended thinking block, starting content block at index {current_block_index}")
+                                
+                                current_block_type = "content"
+                                content_block = ContentBlock(text="")
+                                start_event = ContentBlockStart(index=current_block_index, content_block=content_block)
+                                yield to_sse(event=Event.content_block_start.value, data=start_event)
+                            
+                            # content delta 전송
+                            text_delta = ContentBlockDeltaDelta(text=content)
+                            delta_event = ContentBlockDelta(index=current_block_index, delta=text_delta)
+                            yield to_sse(event=Event.content_block_delta.value, data=delta_event)
+                            print(f"💬 Content: {content}")
+                        
+                        if thinking:
+                            thinking_text += thinking
+                            if current_block_type != "thinking":
+                                if current_block_type == "content":
+                                    # content 블록이 있었다면 먼저 종료
                                     yield to_sse(event=Event.content_block_stop.value, data=ContentBlockStop(index=current_block_index))
                                     current_block_index += 1
                                 
-                                current_block_type = "content"
-                                start_event = ContentBlockStart(index=current_block_index, content_block=ContentBlock(text=""))
+                                current_block_type = "thinking"
+                                thinking_block = ContentBlockThinking()
+                                start_event = ContentBlockStart(index=current_block_index, content_block=thinking_block)
                                 yield to_sse(event=Event.content_block_start.value, data=start_event)
+                                print(f"🧠 Started thinking block at index {current_block_index}")
                             
-                            delta_event = ContentBlockDelta(index=current_block_index, delta=ContentBlockDeltaDelta(text=content))
+                            # thinking delta 전송
+                            thinking_delta = ContentBlockThinkingDeltaDelta(thinking=thinking)
+                            delta_event = ContentBlockDelta(index=current_block_index, delta=thinking_delta)
                             yield to_sse(event=Event.content_block_delta.value, data=delta_event)
+                            print(f"🧠 Thinking: {thinking}")
 
                     except json.JSONDecodeError as e:
                         print(f"⚠️  JSON decode error: {e}")
                         continue
+                
                 
                 if final_tool_calls:
                     print(f"🛠️  Processing {len(final_tool_calls)} tool calls at the end of stream.")
